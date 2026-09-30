@@ -1,3 +1,11 @@
+"""Confidence engine (BLOCKORA §28, §65, §66).
+
+Confidence is a separate layer from the raw score, on a 0-100 scale. It is
+NOT a probability. Historical evidence uses real outcome samples from SQLite
+and is gated by MIN_HISTORICAL_SAMPLES (§65): small samples receive a
+reliability penalty instead of being extrapolated (§66).
+"""
+
 from app.config import config
 
 
@@ -16,17 +24,17 @@ class ConfidenceEngine:
             return "LOW"
         return "NO CLEAR SIGNAL"
 
-    def calculate(self, best_candidate, data_quality, regime, previous_cycle=None):
+    def calculate(self, best_candidate, data_quality, regime, previous_cycle=None, historical_stats=None):
         if not best_candidate:
             return 0.0, "NO CLEAR SIGNAL"
 
-        # total_score is raw sum 0-90 (from WEIGHTS), used directly
         score = best_candidate.get("total_score", 0)
-        # Clamp to valid 0-90 range (defensive, should already be in range)
-        score = max(0, min(90, float(score)))
+        try:
+            score = max(0.0, min(100.0, float(score)))
+        except (TypeError, ValueError):
+            score = 0.0
 
-        rr = best_candidate.get("risk_reward") or 0
-        # Normalize RR to 0-1 range for the formula
+        rr = best_candidate.get("risk_reward")
         try:
             rr_norm = min(float(rr) / 2.0, 1.0) if rr is not None else 0.0
         except (TypeError, ValueError):
@@ -38,35 +46,45 @@ class ConfidenceEngine:
         except (TypeError, ValueError):
             liquidity = 0.0
 
-        source_agreement = 80 if best_candidate.get("source") else 50
-        # source_agreement is already 0-100
+        # Source agreement: real conflict check feeds this in the caller via
+        # historical_stats["source_agreement"]; default is unknown, not great.
+        source_agreement = 50
+        if historical_stats and historical_stats.get("source_agreement") is not None:
+            source_agreement = historical_stats["source_agreement"]
 
         regime_clarity = 85 if regime in ("BULLISH", "BEARISH", "BREAKOUT", "BREAKDOWN") else 55
-        # regime_clarity is already 0-100
 
-        historical_evidence = 70
-        previous_consistency = 70
+        # Historical evidence from real outcome samples only (§65, §66).
+        historical_evidence = 50
+        if historical_stats:
+            samples = historical_stats.get("samples", 0)
+            if samples and samples >= config.MIN_HISTORICAL_SAMPLES:
+                historical_evidence = 50 + min(40.0, (samples / 100.0) * 40.0)
+                wins = historical_stats.get("target_reached", 0)
+                historical_evidence += min(10.0, (wins / samples) * 100.0 * 0.1)
+            else:
+                # Small sample: reliability penalty (§66), never 100% confidence.
+                historical_evidence = 50
 
+        previous_consistency = 50
         if previous_cycle:
             prev_score = previous_cycle.get("best_score")
-            curr_score = best_candidate.get("total_score")
-            if prev_score is not None and curr_score is not None:
-                if curr_score >= prev_score:
+            if prev_score is not None:
+                if score >= float(prev_score):
                     previous_consistency = 85
                 else:
                     previous_consistency = 55
 
         confidence = (
-            score * 0.35 +
-            data_quality * 0.20 +
-            rr_norm * 100 * 0.10 +
-            liquidity * 10 * 0.10 +
-            source_agreement * 0.10 +
-            regime_clarity * 0.10 +
-            historical_evidence * 0.03 +
-            previous_consistency * 0.02
+            score * 0.30
+            + data_quality * 0.20
+            + rr_norm * 100 * 0.10
+            + liquidity * 10 * 0.10
+            + source_agreement * 0.10
+            + regime_clarity * 0.10
+            + historical_evidence * 0.05
+            + previous_consistency * 0.05
         )
 
-        # Clamp final confidence to 0-100 range
-        confidence = max(0, min(100, round(confidence, 2)))
+        confidence = max(0.0, min(100.0, round(confidence, 2)))
         return confidence, self.confidence_band(confidence)

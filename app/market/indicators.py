@@ -1,6 +1,17 @@
 import math
 
 
+def _finite(value):
+    """Return value as float only when it is a finite number, else None."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(v) or math.isinf(v):
+        return None
+    return v
+
+
 def safe_div(a, b):
     if a is None or b in (None, 0):
         return None
@@ -31,11 +42,17 @@ def ema(values, period):
     return e
 
 
-def vwap(closes, highs, lows, volumes):
+def vwap(highs, lows, closes, volumes):
+    """Rolling session VWAP from real H/L/C/V tuples (BLOCKORA §12, §16).
+
+    Averages over the stored window; None inputs are skipped entirely and the
+    result is None unless at least one fully valid tuple exists.
+    """
     num = 0.0
     den = 0.0
     for h, l, c, v in zip(highs, lows, closes, volumes):
-        if None in (h, l, c, v):
+        h, l, c, v = _finite(h), _finite(l), _finite(c), _finite(v)
+        if h is None or l is None or c is None or v in (None, 0):
             continue
         tp = (h + l + c) / 3.0
         num += tp * v
@@ -58,14 +75,21 @@ def atr(highs, lows, closes, period=14):
         return None
     trs = []
     for i in range(1, len(closes)):
-        trs.append(true_range(highs[i], lows[i], closes[i - 1]))
+        tr = true_range(
+            _finite(highs[i]) if i < len(highs) else None,
+            _finite(lows[i]) if i < len(lows) else None,
+            _finite(closes[i - 1]),
+        )
+        if tr is not None:
+            trs.append(tr)
     if len(trs) < period:
         return None
     return sum(trs[-period:]) / period
 
 
 def realized_volatility(returns):
-    vals = [r for r in returns if r is not None]
+    vals = [_finite(r) for r in returns if r is not None]
+    vals = [v for v in vals if v is not None]
     if len(vals) < 2:
         return None
     mean = sum(vals) / len(vals)

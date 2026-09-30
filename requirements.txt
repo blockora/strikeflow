@@ -1,11 +1,7 @@
 smartapi-python
 websocket-client
 pyotp
-logzero
 pycryptodome
 requests
-pandas
-numpy
 python-dotenv
-jugaad-data
 pytz

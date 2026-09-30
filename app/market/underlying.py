@@ -1,53 +1,76 @@
-import math
+import logging
+import time
 
+from app.config import config
 from app.data.cache import cache
+from app.data.validator import validator
 from app.market.indicators import atr, ema, pct_change, realized_volatility, sma, vwap
+
+logger = logging.getLogger(__name__)
 
 
 def _safe_float(value):
     try:
         v = float(value)
-        if math.isnan(v) or math.isinf(v):
-            return None
-        return v
     except (TypeError, ValueError):
         return None
+    if v != v or v in (float("inf"), float("-inf")):
+        return None
+    return v
 
 
 class UnderlyingEngine:
+    """Underlying (spot) analysis engine (BLOCKORA §12, §16).
+
+    Keeps a bounded history of real quotes for trend/momentum/volatility
+    computation. Quotes are appended only when the validator accepts them, so
+    stale or missing data never enters the trend picture.
+    """
+
+    MAX_HISTORY = 300
+
     def __init__(self, symbol="NIFTY"):
         self.symbol = symbol
         self.price_history = []
         self.high_history = []
         self.low_history = []
         self.volume_history = []
+        self.timestamps = []
+        self._last_quote_ltp = None
 
     def _ensure_history(self, quote):
         if quote is None:
             return
         ltp = _safe_float(quote.get("ltp"))
+        if ltp is None:
+            return
+        now = time.time()
+        # At most one sample per second: dedupes repeated REST polls and
+        # WebSocket bursts without inventing intermediate prices.
+        if self.timestamps and now - self.timestamps[-1] < 1.0:
+            return
         high = _safe_float(quote.get("high"))
         low = _safe_float(quote.get("low"))
         vol = _safe_float(quote.get("volume"))
-        if ltp is not None:
-            self.price_history.append(ltp)
-            if len(self.price_history) > 300:
-                self.price_history = self.price_history[-300:]
-            if high is not None:
-                self.high_history.append(high)
-                if len(self.high_history) > 300:
-                    self.high_history = self.high_history[-300:]
-            if low is not None:
-                self.low_history.append(low)
-                if len(self.low_history) > 300:
-                    self.low_history = self.low_history[-300:]
-            if vol is not None:
-                self.volume_history.append(vol)
-                if len(self.volume_history) > 300:
-                    self.volume_history = self.volume_history[-300:]
+        self.price_history.append(ltp)
+        self.timestamps.append(now)
+        self.high_history.append(high if high is not None else ltp)
+        self.low_history.append(low if low is not None else ltp)
+        self.volume_history.append(vol if vol is not None else 0.0)
+        if len(self.price_history) > self.MAX_HISTORY:
+            self.price_history = self.price_history[-self.MAX_HISTORY:]
+            self.timestamps = self.timestamps[-self.MAX_HISTORY:]
+            self.high_history = self.high_history[-self.MAX_HISTORY:]
+            self.low_history = self.low_history[-self.MAX_HISTORY:]
+            self.volume_history = self.volume_history[-self.MAX_HISTORY:]
 
     def update_from_cache(self):
         quote = cache.get_underlying(self.symbol)
+        ok, reason = validator.validate_quote(quote)
+        if not ok:
+            if quote is not None:
+                logger.warning("Underlying quote rejected (%s) for %s", reason, self.symbol)
+            return quote
         self._ensure_history(quote)
         return quote
 
@@ -69,36 +92,23 @@ class UnderlyingEngine:
                 "vwap": None,
                 "atr": None,
                 "realized_volatility": None,
+                "recent_high": None,
+                "recent_low": None,
                 "trend": "NEUTRAL",
+                "samples": 0,
             }
 
         last = closes[-1]
         prev = closes[-2] if len(closes) > 1 else None
         ret_1m = pct_change(last, prev)
-
-        ret_3m = None
-        if len(closes) > 3:
-            ret_3m = pct_change(last, closes[-4])
-
-        ret_5m = None
-        if len(closes) > 5:
-            ret_5m = pct_change(last, closes[-6])
+        ret_3m = pct_change(last, closes[-4]) if len(closes) > 3 else None
+        ret_5m = pct_change(last, closes[-6]) if len(closes) > 5 else None
 
         ma_fast = ema(closes, 5) or sma(closes, 5)
         ma_slow = ema(closes, 20) or sma(closes, 20)
 
-        # Use actual high/low history; fall back to closes if insufficient
-        if highs and len(highs) >= len(closes):
-            effective_highs = highs
-        else:
-            effective_highs = closes
-        if lows and len(lows) >= len(closes):
-            effective_lows = lows
-        else:
-            effective_lows = closes
-
-        vw = vwap(effective_highs, effective_lows, closes, volumes)
-        atr_val = atr(effective_highs, effective_lows, closes, 14)
+        vw = vwap(highs, lows, closes, volumes)
+        atr_val = atr(highs, lows, closes, 14)
         vol = realized_volatility(
             [pct_change(closes[i], closes[i - 1]) for i in range(1, len(closes))]
         )
@@ -121,5 +131,8 @@ class UnderlyingEngine:
             "vwap": vw,
             "atr": atr_val,
             "realized_volatility": vol,
+            "recent_high": max(highs) if highs else None,
+            "recent_low": min(lows) if lows else None,
             "trend": trend,
+            "samples": len(closes),
         }

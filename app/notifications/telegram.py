@@ -67,19 +67,24 @@ def _fingerprint(recommendation):
 
 
 class TelegramNotifier:
-    """Telegram notification handler for Option Strike Selector recommendations."""
+    """Telegram notification handler for Option Strike Selector recommendations.
+
+    Decision-support only (BLOCKORA §77): messages describe signals; nothing
+    here places, modifies or cancels orders. Credentials come only from .env
+    (§52) and are never logged.
+    """
 
     def __init__(self):
         self.enabled = (
-            config.TELEGRAM_ENABLED == "true"
-            and config.TELEGRAM_BOT_TOKEN
-            and config.TELEGRAM_CHAT_ID
+            config.TELEGRAM_ENABLED
+            and bool(config.TELEGRAM_BOT_TOKEN)
+            and bool(config.TELEGRAM_CHAT_ID)
         )
         self.bot_token = config.TELEGRAM_BOT_TOKEN if self.enabled else None
         self.chat_id = config.TELEGRAM_CHAT_ID if self.enabled else None
         self.last_sent = 0
         self.last_fingerprint = None
-        self.min_interval = 300
+        self.min_interval = config.TELEGRAM_MIN_INTERVAL_SECONDS
         self.max_retries = 3
         self.retry_delay = 5
 
@@ -120,19 +125,19 @@ class TelegramNotifier:
                     if data.get("ok", [False])[0]:
                         return True
         except urllib.error.HTTPError as e:
-            # Log sanitized error - never expose bot token
-            try:
-                body = e.read().decode("utf-8")[:200]
-            except Exception:
-                body = "unknown error"
-            # Log would go here, but don't expose credentials
-            pass
+            # Log sanitized error - never expose bot token (§52).
+            import logging
+            logging.getLogger(__name__).warning(
+                "Telegram HTTP error %s (token withheld)", e.code
+            )
         except urllib.error.URLError:
             # Network error - don't crash
-            pass
+            import logging
+            logging.getLogger(__name__).warning("Telegram network error")
         except Exception:
             # Any other error - don't crash
-            pass
+            import logging
+            logging.getLogger(__name__).warning("Telegram send failed", exc_info=True)
 
         return False
 
@@ -242,18 +247,9 @@ class TelegramNotifier:
         # Deduplication: check fingerprint
         fingerprint = _fingerprint(recommendation)
 
-        # Skip if same recommendation as last sent (and cooldown passed)
-        if fingerprint == self.last_fingerprint and not self._is_ratelimited():
-            # Same recommendation, but cooldown hasn't passed - skip
-            return True  # Consider it "sent" to avoid double-logging
-
-        # If same fingerprint as last sent but cooldown expired, send new message
+        # Same recommendation within cooldown: skip silently.
         if fingerprint == self.last_fingerprint and self._is_ratelimited():
-            # Cooldown active, skip but don't count as error
             return True
-
-        # Materially different recommendation - send new message
-        # (always send if fingerprint changed or first time)
 
         # Generate message text
         message = self._get_recommendation_text(recommendation)
