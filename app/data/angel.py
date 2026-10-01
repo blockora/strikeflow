@@ -44,6 +44,7 @@ class AngelDataSource:
         self._option_contracts = {}  # "STRIKE|CE|EXPIRY" -> scrip row
         self.underlying_token = None
         self._reconnect_tick_hook = None
+        self._stopping = False  # set on shutdown: suppresses all reconnects
 
     # --- authentication ---------------------------------------------------
 
@@ -136,6 +137,26 @@ class AngelDataSource:
         logger.info("Scrip master downloaded (%d rows)", len(self.scrip_master))
         return self.scrip_master
 
+    @staticmethod
+    def _expiry_date(value):
+        """Parse a Scrip-Master/chain expiry to a date, or None.
+
+        The master writes '06OCT2026'; the Jugaad chain writes
+        '06-Oct-2026'. Expiry must be compared as a calendar date, never as
+        raw text (BLOCKORA §9: expiry comes from the chain, never inferred
+        from symbol text).
+        """
+        from datetime import datetime
+        if not value:
+            return None
+        text = str(value).strip()
+        for fmt in ("%d%b%Y", "%d-%b-%Y", "%d%b%y", "%d-%b-%y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(text, fmt).date()
+            except (TypeError, ValueError):
+                continue
+        return None
+
     def get_instrument_rows(self, name=None, instrumenttype=None, expiry=None, strike=None, option_type=None):
         if self.scrip_master is None:
             self.load_scrip_master()
@@ -145,18 +166,37 @@ class AngelDataSource:
         if instrumenttype:
             rows = [r for r in rows if r.get("instrumenttype") == instrumenttype]
         if expiry:
-            rows = [r for r in rows if r.get("expiry") == expiry]
+            target = self._expiry_date(expiry)
+            if target is not None:
+                rows = [
+                    r for r in rows
+                    if self._expiry_date(r.get("expiry")) == target
+                ]
+            else:
+                rows = [r for r in rows if r.get("expiry") == expiry]
         if strike is not None:
             try:
                 strike_val = float(strike)
             except (TypeError, ValueError):
                 return []
+
+            def _strike_matches(raw):
+                try:
+                    v = float(raw)
+                except (TypeError, ValueError):
+                    return False
+                # Current master stores option strikes in paise
+                # ('2500000.000000' for 25000); accept either scale so the
+                # comparison follows the actual downloaded data, never an
+                # assumption.
+                return abs(v - strike_val) < 0.01 or abs(v / 100.0 - strike_val) < 0.01
+
             rows = [
                 r for r in rows
-                if r.get("strike") not in (None, "") and abs(float(r["strike"]) - strike_val) < 0.01
+                if r.get("strike") not in (None, "") and _strike_matches(r["strike"])
             ]
         if option_type:
-            rows = [r for r in rows if r.get("symbol").endswith(option_type)]
+            rows = [r for r in rows if str(r.get("symbol", "")).endswith(option_type)]
         return rows
 
     def find_option_contract(self, strike, option_type, expiry):
@@ -181,20 +221,49 @@ class AngelDataSource:
             self._option_contracts[key] = contract
         else:
             logger.warning(
-                "No NFO contract found for %s %s %s (expiry=%s)",
+                "No NFO contract found for %s %s %s (expiry=%s, parsed=%s)",
                 config.UNDERLYING, strike, option_type, expiry,
+                self._expiry_date(expiry),
             )
         return contract
 
     def underlying_token_row(self):
-        """Resolve the underlying (index/equity) scrip row."""
-        rows = self.get_instrument_rows(name=config.UNDERLYING, instrumenttype="INDEX")
-        if rows:
-            return rows[0]
-        rows = self.get_instrument_rows(name=config.UNDERLYING)
-        for row in rows:
-            if row.get("symbol", "").endswith("-EQ"):
+        """Resolve the underlying index instrument from the fresh Scrip Master.
+
+        Real master layout (verified against a live download, 143339 rows):
+        index rows live under exch_seg='NSE' as symbol='NIFTY' (instrumenttype
+        '', the SmartAPI market-feed index token) and as 'Nifty 50'
+        (instrumenttype 'AMXIDX'). The previous lookup (name +
+        instrumenttype='INDEX') matched the CDS-segment 'NIFTY50' INDEX row
+        (token 2), which is not an NSE instrument and made every underlying
+        poll fail with AB4046. The row is validated against the freshly
+        downloaded master before being used or cached; nothing is assumed
+        constant and no token is ever invented (BLOCKORA §9).
+        """
+        if self.scrip_master is None:
+            self.load_scrip_master()
+        segment = str(config.EXCHANGE).upper()
+        name = str(config.UNDERLYING).upper()
+        candidates = [
+            r for r in self.scrip_master
+            if str(r.get("exch_seg", "")).upper() == segment
+        ]
+        # 1) exact symbol match on the configured exchange
+        #    (NIFTY on NSE -> the market-feed index row, token 26000)
+        for row in candidates:
+            if str(row.get("symbol", "")).strip().upper() == name:
                 return row
+        # 2) index-series rows (AMXIDX / INDEX) whose name matches
+        for row in candidates:
+            if (
+                str(row.get("instrumenttype", "")).upper() in ("AMXIDX", "INDEX")
+                and str(row.get("name", "")).strip().upper() == name
+            ):
+                return row
+        logger.warning(
+            "No underlying instrument found in Scrip Master for %s on %s",
+            config.UNDERLYING, segment,
+        )
         return None
 
     def set_underlying_token(self, token):
@@ -253,8 +322,19 @@ class AngelDataSource:
 
         def _on_open(wsapp):
             logger.info("Angel WebSocket open; subscribing %d groups", len(token_list))
-            if token_list:
-                wsapp.subscribe(correlation_id, mode, token_list)
+            if not token_list:
+                return
+            with self._ws_lock:
+                client = self.sws
+            # wsapp is the SDK's internal websocket.WebSocketApp, which has
+            # no subscribe(); the subscribe frame must be sent through the
+            # SmartWebSocketV2 instance (installed smartWebSocketV2.py:
+            # self.wsapp.send(json.dumps(request_data)) inside subscribe()).
+            try:
+                if client is not None:
+                    client.subscribe(correlation_id, mode, token_list)
+            except Exception as exc:
+                logger.error("Angel subscribe failed: %s", exc)
 
         def _on_data(wsapp, message):
             """Cache raw ticks (paise scale) and normalized ticks (rupees).
@@ -281,10 +361,14 @@ class AngelDataSource:
 
         def _on_error(wsapp, error):
             self.connected = False
+            if self._stopping:
+                return  # deliberate close during shutdown: no reconnect noise
             logger.error("Angel WebSocket error: %s", error)
 
         def _on_close(wsapp):
             self.connected = False
+            if self._stopping:
+                return  # deliberate close during shutdown
             logger.warning("Angel WebSocket closed; will attempt reconnect")
 
         sws.on_open = _on_open
@@ -316,6 +400,8 @@ class AngelDataSource:
         are rate-limited; a real SmartWebSocketV2 client is re-created on the
         WebSocket thread (the SDK client is not restartable in place).
         """
+        if self._stopping:
+            return False  # never reconnect once shutdown has begun
         if self.connected and self.sws is not None:
             return True
         now = time.time()
@@ -349,6 +435,15 @@ class AngelDataSource:
         except Exception as exc:
             logger.warning("Angel WebSocket close failed: %s", exc)
         self.connected = False
+
+    def request_stop(self):
+        """Begin deterministic shutdown (no further reconnect attempts).
+
+        Sets the stopping flag BEFORE closing so in-flight callbacks and the
+        SDK's internal retry path observe it and stay quiet (§74).
+        """
+        self._stopping = True
+        self.stop_websocket()
 
     # --- observability -------------------------------------------------------
 

@@ -12,8 +12,6 @@ Decision-support only: no order placement, modification or cancellation
 exists anywhere in this codebase (§54, §88).
 """
 
-import logging
-import os
 import signal
 import sys
 import threading
@@ -23,6 +21,7 @@ from datetime import datetime
 import pytz
 
 from app.config import config
+from app.logging_setup import setup_logging
 from app.data.angel import angel_source
 from app.data.cache import cache
 from app.data.jugaad import jugaad_source
@@ -44,17 +43,10 @@ from app.selector.scoring import ScoringEngine
 
 IST = pytz.timezone("Asia/Kolkata")
 
-# Terminal + rotating file logging without printing secrets (§52, §59).
-os.makedirs(config.LOG_DIR, exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stderr),
-        logging.FileHandler(os.path.join(config.LOG_DIR, "app.log"), encoding="utf-8"),
-    ],
-)
-logger = logging.getLogger("blockora")
+# Terminal + rotating file logging with secret redaction at the boundary:
+# SmartAPI/logzero output (Authorization, X-PrivateKey, raw payloads) is
+# sanitized before any handler emits it (§52, §59).
+logger = setup_logging()
 
 
 def _safe_float(value):
@@ -101,16 +93,37 @@ class OptionStrikeSelector:
             angel_source.underlying_token_row()
             row = angel_source.underlying_token_row()
             if row and row.get("token"):
+                # Validated against the freshly downloaded Scrip Master before
+                # use. REST LTP is only possible for real -EQ instruments; the
+                # market-feed index row (e.g. NIFTY on NSE) carries no
+                # tradingsymbol, so the WebSocket is its sole Angel path (§9).
                 self.underlying_token = str(row["token"])
+                symbol_text = str(row.get("symbol", ""))
+                self.underlying_tradingsymbol = symbol_text if symbol_text.endswith("-EQ") else None
+                logger.info(
+                    "Underlying resolved from Scrip Master: %s token=%s",
+                    row.get("symbol"), self.underlying_token,
+                )
             else:
-                self.underlying_token = config.UNDERLYING_TOKEN
-                logger.info("Using configured underlying token %s", self.underlying_token)
-            angel_source.set_underlying_token(self.underlying_token)
+                self.underlying_token = None
+                logger.warning(
+                    "No valid underlying instrument in Scrip Master for %s on %s; "
+                    "Angel underlying polling disabled, Jugaad remains the spot source",
+                    config.UNDERLYING, config.EXCHANGE,
+                )
+                db.log_event("ANGEL_UNDERLYING_UNRESOLVED", config.UNDERLYING)
+            angel_source.set_underlying_token(self.underlying_token or "")
         except Exception as exc:
-            logger.warning("Scrip master load failed: %s", exc)
-            self.underlying_token = config.UNDERLYING_TOKEN
-            angel_source.set_underlying_token(self.underlying_token)
+            logger.warning("Scrip master load failed: %s; Angel underlying polling disabled", exc)
+            self.underlying_token = None
+            angel_source.set_underlying_token("")
 
+        if not self.underlying_token:
+            logger.warning(
+                "Angel WebSocket not started: no validated underlying token "
+                "(Jugaad remains the live source)"
+            )
+            return
         try:
             angel_source._reconnect_tick_hook = self._on_angel_tick
             angel_source.start_websocket_thread(
@@ -150,9 +163,16 @@ class OptionStrikeSelector:
         while self.running:
             try:
                 if angel_source.connected and getattr(self, "underlying_token", None):
+                    # NIFTY's NSE market-feed row (token 26000) has no
+                    # tradingsymbol, so the WebSocket is the sole Angel path
+                    # for it; REST LTP only for real -EQ instruments (§9).
+                    tradingsymbol = getattr(self, "underlying_tradingsymbol", None)
+                    if tradingsymbol is None:
+                        time.sleep(config.ANGEL_UNDERLYING_POLL_SECONDS)
+                        continue
                     data = angel_source.ltp_data(
                         config.EXCHANGE,
-                        f"{config.UNDERLYING}-EQ",
+                        tradingsymbol,
                         self.underlying_token,
                     )
                     quote = (data or {}).get("data", {})
@@ -181,6 +201,31 @@ class OptionStrikeSelector:
                 if chain.get("status") == "success" and chain.get("raw"):
                     cache.update_option_chain(config.UNDERLYING, chain)
                     self.jugaad_ok = True
+                    # Spot fallback: when no fresh Angel underlying quote is
+                    # available, derive spot from the real chain
+                    # underlyingValue so the engine keeps running without
+                    # inventing a value (§5, §6, §7).
+                    angel_quote = cache.get_underlying(config.UNDERLYING)
+                    angel_age = cache.underlying_age(config.UNDERLYING)
+                    angel_usable = (
+                        angel_quote is not None
+                        and _safe_float(angel_quote.get("ltp")) is not None
+                        and (angel_age is None or angel_age <= config.MAX_STALE_SECONDS)
+                    )
+                    if not angel_usable:
+                        underlying_value = None
+                        for row in chain["raw"].get("data") or []:
+                            if isinstance(row, dict) and row.get("underlyingValue") is not None:
+                                try:
+                                    underlying_value = float(row["underlyingValue"])
+                                    break
+                                except (TypeError, ValueError):
+                                    continue
+                        if underlying_value is not None:
+                            cache.update_underlying(config.UNDERLYING, {
+                                "source": "JUGAAD",
+                                "ltp": underlying_value,
+                            })
                 else:
                     self.jugaad_ok = False
                     logger.info("Jugaad chain unavailable: %s (%s)", chain.get("status"), chain.get("error"))
@@ -521,7 +566,12 @@ class OptionStrikeSelector:
                 sleep_until_next_cycle()
         finally:
             self.running = False
-            angel_source.stop_websocket()
+            # Deterministic shutdown: flag first (no new reconnects anywhere),
+            # then close the socket, then join the worker thread (§74).
+            angel_source.request_stop()
+            ws_thread = angel_source._ws_thread
+            if ws_thread is not None and ws_thread.is_alive():
+                ws_thread.join(timeout=10)
             db.log_event("SHUTDOWN", "engine stopped")
             logger.info("BLOCKORA stopped")
 
