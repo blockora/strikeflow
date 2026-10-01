@@ -42,6 +42,8 @@ class AngelDataSource:
         self._ticks_received = 0
         self._last_tick_ts = None
         self._option_contracts = {}  # "STRIKE|CE|EXPIRY" -> scrip row
+        self._missing_contracts = set()  # lookups with no NFO row in the master
+        self._missing_warned = set()  # absent contracts already reported
         self.underlying_token = None
         self._reconnect_tick_hook = None
         self._stopping = False  # set on shutdown: suppresses all reconnects
@@ -109,6 +111,11 @@ class AngelDataSource:
 
     def load_scrip_master(self):
         """Download and cache the Scrip Master JSON on disk (BLOCKORA §4)."""
+        # A newly loaded master invalidates resolved and missing lookups:
+        # expiries roll and the traded strike set changes (BLOCKORA §9).
+        self._option_contracts = {}
+        self._missing_contracts = set()
+        self._missing_warned = set()
         cache_dir = os.path.join(config.LOG_DIR, "cache")
         os.makedirs(cache_dir, exist_ok=True)
         cache_path = os.path.join(cache_dir, "scrip_master.json")
@@ -199,15 +206,29 @@ class AngelDataSource:
             rows = [r for r in rows if str(r.get("symbol", "")).endswith(option_type)]
         return rows
 
-    def find_option_contract(self, strike, option_type, expiry):
+    def find_option_contract(self, strike, option_type, expiry, warn=True):
         """Resolve an NFO option contract via Scrip Master (BLOCKORA §9).
 
         Returns the scrip row with token/tradingsymbol/lotsize, or None.
         Expiry comes from the chain data, never inferred from symbol text.
+
+        A miss is an expected outcome, not an anomaly: the NSE chain lists a
+        wide strike band for an expiry while the master only carries the
+        strikes actually traded for it. Callers that sweep the whole chain
+        pass warn=False; a miss on a contract the app actually selected is
+        still reported exactly once. Misses are cached so the (large) master
+        scan is not repeated for every cycle.
         """
         key = f"{strike}|{option_type}|{expiry}"
         if key in self._option_contracts:
             return self._option_contracts[key]
+        if key in self._missing_contracts:
+            # Already known to be absent: never rescan the master, but a
+            # selected contract must still be reported to the operator.
+            if warn and key not in self._missing_warned:
+                self._missing_warned.add(key)
+                self._warn_missing_contract(strike, option_type, expiry)
+            return None
 
         candidates = self.get_instrument_rows(
             name=config.UNDERLYING,
@@ -220,12 +241,18 @@ class AngelDataSource:
         if contract:
             self._option_contracts[key] = contract
         else:
-            logger.warning(
-                "No NFO contract found for %s %s %s (expiry=%s, parsed=%s)",
-                config.UNDERLYING, strike, option_type, expiry,
-                self._expiry_date(expiry),
-            )
+            self._missing_contracts.add(key)
+            if warn:
+                self._missing_warned.add(key)
+                self._warn_missing_contract(strike, option_type, expiry)
         return contract
+
+    def _warn_missing_contract(self, strike, option_type, expiry):
+        logger.warning(
+            "No NFO contract found for %s %s %s (expiry=%s, parsed=%s)",
+            config.UNDERLYING, strike, option_type, expiry,
+            self._expiry_date(expiry),
+        )
 
     def underlying_token_row(self):
         """Resolve the underlying index instrument from the fresh Scrip Master.

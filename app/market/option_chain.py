@@ -64,7 +64,12 @@ class OptionChainEngine:
                 side_data = row.get(side)
                 if not side_data:
                     continue
-                contract = angel_find_contract(row.get("strike"), side.upper(), row.get("expiry"))
+                # warn=False: this sweeps every chain row, most of which the
+                # broker does not list for that expiry (BLOCKORA §13 requires
+                # per-strike data for candidates, not for the whole chain).
+                contract = angel_find_contract(
+                    row.get("strike"), side.upper(), row.get("expiry"), warn=False
+                )
                 if not contract:
                     continue
                 token = str(contract.get("token"))
@@ -126,10 +131,10 @@ class OptionChainEngine:
         return diff_pct <= config.SPOT_TOLERANCE_PCT
 
 
-def angel_find_contract(strike, option_type, expiry):
+def angel_find_contract(strike, option_type, expiry, warn=True):
     """Scrip-master lookup helper kept lazy to avoid import cycles."""
     from app.data.angel import angel_source
 
     if angel_source.scrip_master is None:
         return None
-    return angel_source.find_option_contract(strike, option_type, expiry)
+    return angel_source.find_option_contract(strike, option_type, expiry, warn=warn)
