@@ -16,6 +16,12 @@ Schema evolution (BLOCKORA §74: restarts must never lose history):
 
 Add a new step to _MIGRATIONS (and bump SCHEMA_VERSION) whenever a committed
 schema change affects tables that may already exist on a production device.
+
+The post-migration integrity check verifies exactly the columns the
+application reads/writes (see _REQUIRED_COLUMNS). Synthetic AUTOINCREMENT
+primary keys (snapshot_id / id) are fresh-DDL identity only: no query in
+this codebase references them, so legacy tables created without them stay
+valid — they are never force-added to historical rows.
 """
 
 import logging
@@ -218,27 +224,22 @@ class Database:
         ),
     }
 
-    # Tables whose presence and full column contract are verified after
-    # migration (mirrors the CREATE TABLE statements above).
-    _REQUIRED_TABLES = (
-        "market_snapshots",
-        "option_snapshots",
-        "cycles",
-        "candidate_scores",
-        "signals",
-        "signal_state_history",
-        "signal_outcomes",
-        "system_events",
-    )
-
-    _CURRENT_SCHEMA_COLUMNS = {
+    # Columns the application actually reads/writes per table (INSERT
+    # contracts in app/history/*.py plus PKs used by SELECT/ORDER/JOIN).
+    # Mirrors what real queries require — deliberately NOT the full CREATE
+    # TABLE DDL, because synthetic AUTOINCREMENT PKs (snapshot_id / id) are
+    # never referenced by application code and must not be forced onto legacy
+    # production tables. Columns used by app code: cycles.cycle_id
+    # (latest_cycle ORDER BY), signals.signal_id / signal_outcomes.signal_id
+    # (PK lookups/JOIN); snapshot_id / id are used nowhere.
+    _REQUIRED_COLUMNS = {
         "market_snapshots": (
-            "snapshot_id", "cycle_id", "timestamp", "underlying", "spot",
-            "source", "vwap", "atr", "trend", "regime", "data_quality",
+            "cycle_id", "timestamp", "underlying", "spot", "source",
+            "vwap", "atr", "trend", "regime", "data_quality",
         ),
         "option_snapshots": (
-            "snapshot_id", "cycle_id", "timestamp", "underlying", "expiry",
-            "strike", "option_type", "ltp", "bid", "ask", "volume", "oi",
+            "cycle_id", "timestamp", "underlying", "expiry", "strike",
+            "option_type", "ltp", "bid", "ask", "volume", "oi",
             "oi_change", "iv", "source", "data_timestamp",
         ),
         "cycles": (
@@ -247,7 +248,7 @@ class Database:
             "entry", "stop_loss", "target", "risk_reward", "signal_state",
         ),
         "candidate_scores": (
-            "id", "cycle_id", "symbol", "strike", "option_type", "ltp", "bid",
+            "cycle_id", "symbol", "strike", "option_type", "ltp", "bid",
             "ask", "volume", "oi", "oi_change", "iv", "delta", "gamma",
             "theta", "vega", "momentum_score", "oi_score", "volume_score",
             "liquidity_score", "greeks_score", "iv_score",
@@ -259,14 +260,14 @@ class Database:
             "confidence", "regime", "state",
         ),
         "signal_state_history": (
-            "id", "signal_id", "timestamp", "state", "score", "confidence",
+            "signal_id", "timestamp", "state", "score", "confidence",
         ),
         "signal_outcomes": (
             "signal_id", "entry", "highest_after_entry", "lowest_after_entry",
             "target", "sl", "result", "time_to_result",
         ),
         "system_events": (
-            "id", "timestamp", "event", "details",
+            "timestamp", "event", "details",
         ),
     }
 
@@ -319,7 +320,7 @@ class Database:
 
             # Safety gate: every required table must exist (created above by
             # CREATE TABLE IF NOT EXISTS).
-            missing_tables = [t for t in self._REQUIRED_TABLES if t not in existing_tables]
+            missing_tables = [t for t in self._REQUIRED_COLUMNS if t not in existing_tables]
             if missing_tables:
                 raise SchemaMigrationError(
                     f"Migration aborted: required tables missing from "
@@ -352,10 +353,11 @@ class Database:
 
             logger.info("Database schema migrated to v%s", self.SCHEMA_VERSION)
 
-        # Final integrity check: every column declared in the CREATE TABLE
-        # contract must exist after migration, so the INSERT statements in
-        # app/history/cycles.py can never hit a missing column.
-        for table, columns in self._CURRENT_SCHEMA_COLUMNS.items():
+        # Final integrity check: every column the application actually reads
+        # or writes must exist after migration, so the INSERT/SELECT contracts
+        # in app/history/*.py can never hit a missing column. Legacy tables
+        # lacking synthetic PKs (snapshot_id/id) remain valid by design.
+        for table, columns in self._REQUIRED_COLUMNS.items():
             if table not in existing_tables:
                 raise SchemaMigrationError(
                     f"Schema integrity check failed: required table "
