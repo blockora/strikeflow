@@ -1,9 +1,14 @@
-"""Terminal report (BLOCKORA §55, §56, §70).
+"""Terminal report (BLOCKORA §55, §56, §58, §70).
 
-Structured per-cycle output including the NO CLEAR STRIKE block with gate
-failure reasons, and a connection-status line. All values print as N/A when
-missing — nothing is fabricated for display.
+Single-result live output: one BEST STRIKE block when every gate passes,
+otherwise a NO CLEAR STRIKE block with the exact gate failures. The internal
+ten-candidate analysis, ranking and Top-3 backup (§10, §11, §58) are computed
+and persisted exactly as before — they are simply not printed here. Values
+print as N/A when missing; nothing is fabricated for display (§7).
 """
+
+_WIDTH = 60
+_RULE = "=" * _WIDTH
 
 
 def _fmt(val, na="N/A"):
@@ -19,6 +24,17 @@ def _fmt_num(val, digits=2, na="N/A"):
         return na
 
 
+def _fmt_strike(val, na="N/A"):
+    """Strikes arrive as floats from the chain; show 22250, not 22250.0."""
+    if val is None:
+        return na
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return val
+    return str(int(f)) if f.is_integer() else str(f)
+
+
 def print_status_line(angel_status, jugaad_status, db_status, last_data, next_cycle):
     print(
         f"Angel: {angel_status} | Jugaad: {jugaad_status} | "
@@ -27,61 +43,30 @@ def print_status_line(angel_status, jugaad_status, db_status, last_data, next_cy
     )
 
 
-def print_cycle_report(report):
-    print("=" * 60)
-    print("OPTION STRIKE SELECTOR")
-    print("=" * 60)
+def _market_context(report):
+    """Cycle/time and market context shared by both single-result blocks."""
     print(f"Cycle       : {_fmt(report.get('cycle_id'))}")
     print(f"Time        : {_fmt(report.get('time'))}")
     print(f"Underlying  : {_fmt(report.get('underlying'))}")
     print(f"Spot        : {_fmt_num(report.get('spot'))}")
     print(f"Expiry      : {_fmt(report.get('expiry'))}")
     print(f"Regime      : {_fmt(report.get('regime'))}")
-    print(f"Data Quality: {_fmt_num(report.get('data_quality'), 1)}/100")
-    if report.get("data_note"):
-        print(f"Data Note   : {report['data_note']}")
-    print("-" * 60)
-    print("TOP 10 CANDIDATES")
-    print("-" * 60)
-    candidates = report.get("candidates") or []
-    if not candidates:
-        print("INSUFFICIENT VALID CANDIDATES")
-        print(f"Reason: {report.get('candidate_status', 'NO_CHAIN_DATA')}")
-    else:
-        print("Rank  Strike       Type   Score")
-        for c in candidates:
-            print(
-                f"{c.get('rank', '?'):<5} "
-                f"{_fmt(c.get('strike')):<12} "
-                f"{_fmt(c.get('option_type')):<6} "
-                f"{_fmt_num(c.get('total_score'))}"
-            )
 
-    best = report.get("best")
-    if not best:
-        print("-" * 60)
-        print("NO CLEAR STRIKE")
-        print("-" * 60)
-        print(f"Best Raw Score : {_fmt_num(report.get('best_raw_score'))}")
-        print(f"Required Score : {_fmt_num(report.get('required_score'))}")
-        gate = report.get("gate_reason")
-        if gate:
-            print(f"Gate Failure   : {gate}")
-        print("Reason:")
-        for r in report.get("no_signal_reasons", []):
-            print(f"- {r}")
-        print("RESULT:")
-        print("NO SIGNAL")
-        print("=" * 60)
-        return
 
-    print("-" * 60)
-    print("BEST STRIKE")
-    print("-" * 60)
-    print(
-        f"Symbol      : {_fmt(best.get('underlying'))} {_fmt(best.get('expiry'))} "
-        f"{_fmt(best.get('strike'))} {_fmt(best.get('option_type'))}"
-    )
+def _confidence(report):
+    value = report.get("confidence_value")
+    if value is None:
+        return "N/A"
+    return f"{_fmt(report.get('confidence_label'))} ({_fmt_num(value)})"
+
+
+def print_best_strike(report, best):
+    """BLOCKORA §55: the single highest-quality strike, nothing else."""
+    print(_RULE)
+    print("BLOCKORA — BEST STRIKE")
+    print(_RULE)
+    _market_context(report)
+    print(f"Strike      : {_fmt_strike(best.get('strike'))} {_fmt(best.get('option_type'))}")
     print(f"LTP         : {_fmt_num(best.get('ltp'))}")
     entry_low = best.get("entry_low")
     entry_high = best.get("entry_high")
@@ -89,30 +74,56 @@ def print_cycle_report(report):
         print(f"Entry Zone  : {_fmt_num(entry_low)} - {_fmt_num(entry_high)}")
     else:
         print("Entry Zone  : N/A")
-    print(f"Stop Loss   : {_fmt_num(best.get('stop_loss'))} ({_fmt(best.get('sl_reason'))})")
+    print(f"Stop Loss   : {_fmt_num(best.get('stop_loss'))}")
     print(f"Target      : {_fmt_num(best.get('target'))}")
-    print(f"Risk        : {_fmt_num(best.get('risk'))}")
-    print(f"Reward      : {_fmt_num(best.get('reward'))}")
     rr = best.get("risk_reward")
-    print(f"R:R         : 1 : {_fmt_num(rr)}" if rr is not None else "R:R         : N/A")
+    if rr is not None:
+        print(f"Risk/Reward : 1 : {_fmt_num(rr)}")
+    else:
+        print("Risk/Reward : N/A")
     print(f"Score       : {_fmt_num(best.get('total_score'))}/100")
-    print(f"Confidence  : {_fmt(report.get('confidence_label'))} ({_fmt_num(report.get('confidence_value'))})")
+    print(f"Confidence  : {_confidence(report)}")
     print(f"Data Quality: {_fmt_num(report.get('data_quality'), 1)}/100")
-    print("-" * 60)
-    print("PREVIOUS CYCLE")
-    print("-" * 60)
-    print(f"Previous Strike : {_fmt(report.get('previous_symbol'), 'None')}")
-    print(f"Previous Score  : {_fmt_num(report.get('previous_score'))}")
-    print(f"Current Score   : {_fmt_num(best.get('total_score'))}")
-    print(f"Change          : {_fmt_num(report.get('score_change'))}")
-    print(f"State           : {_fmt(report.get('signal_state'))}")
-    print("-" * 60)
-    print("REASONS")
-    print("-" * 60)
+    print(f"State       : {_fmt(report.get('signal_state'))}")
     reasons = best.get("reasons") or []
     if reasons:
-        for reason in reasons:
-            print(f"[+] {reason}")
+        print("Reasons     : " + "; ".join(str(r) for r in reasons))
     else:
-        print("N/A")
-    print("=" * 60)
+        print("Reasons     : N/A")
+    if report.get("previous_symbol") is not None or report.get("previous_score") is not None:
+        print(
+            f"Previous    : {_fmt(report.get('previous_symbol'), 'None')} | "
+            f"score {_fmt_num(report.get('previous_score'))} -> "
+            f"{_fmt_num(best.get('total_score'))} "
+            f"(change {_fmt_num(report.get('score_change'))})"
+        )
+    print(_RULE)
+
+
+def print_no_clear_strike(report):
+    """BLOCKORA §56: insufficient evidence, stated exactly and honestly."""
+    print(_RULE)
+    print("BLOCKORA — NO CLEAR STRIKE")
+    print(_RULE)
+    _market_context(report)
+    print(f"Best Score  : {_fmt_num(report.get('best_raw_score'))}/100")
+    print(f"Required    : {_fmt_num(report.get('required_score'))}/100")
+    print(f"Confidence  : {_confidence(report)}")
+    print(f"Data Quality: {_fmt_num(report.get('data_quality'), 1)}/100")
+    print(f"Gate Failure: {_fmt(report.get('gate_reason'))}")
+    reasons = report.get("no_signal_reasons") or []
+    if reasons:
+        print("Reason      : " + "; ".join(str(r) for r in reasons))
+    else:
+        print("Reason      : N/A")
+    print("RESULT      : NO SIGNAL")
+    print(_RULE)
+
+
+def print_cycle_report(report):
+    """Render the single decision-support result for one cycle."""
+    best = report.get("best")
+    if best:
+        print_best_strike(report, best)
+    else:
+        print_no_clear_strike(report)
