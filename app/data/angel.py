@@ -320,6 +320,34 @@ class AngelDataSource:
             max_retry_attempt=5,
         )
 
+        # Callback-signature compatibility with the INSTALLED websocket-client
+        # (verified from vendor sources; no site-packages edits):
+        # - websocket/_app.py teardown() dispatches on_close as
+        #   callback(wsapp, close_status_code, close_reason), but the installed
+        #   SDK's SmartWebSocketV2._on_close accepts only (wsapp). The resulting
+        #   TypeError is caught by WebSocketApp._callback and re-routed into
+        #   SDK _on_error, which starts the SDK resubscribe loop even during
+        #   intentional shutdown (observed on real Termux).
+        # - SDK _on_error begins its internal retry BEFORE the application
+        #   callback runs, so the stopping gate must wrap it at the instance
+        #   level; connect() picks up these wrappers when it constructs the
+        #   WebSocketApp (on_close=self._on_close / on_error=self._on_error).
+        _sdk_on_close = sws._on_close
+        _sdk_on_error = sws._on_error
+
+        def _sdk_on_close_compat(wsapp, *args):
+            # websocket-client passes (wsapp, close_status_code, close_reason);
+            # the SDK reads only the socket object.
+            _sdk_on_close(wsapp)
+
+        def _sdk_on_error_compat(wsapp, error):
+            if self._stopping:
+                return  # intentional shutdown: never enter SDK retry/resubscribe
+            _sdk_on_error(wsapp, error)
+
+        sws._on_close = _sdk_on_close_compat
+        sws._on_error = _sdk_on_error_compat
+
         def _on_open(wsapp):
             logger.info("Angel WebSocket open; subscribing %d groups", len(token_list))
             if not token_list:
