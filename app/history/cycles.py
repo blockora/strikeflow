@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 
 import pytz
@@ -11,16 +12,59 @@ def _now_str():
     return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _origin_time_str(value):
+    """Epoch seconds -> IST 'YYYY-MM-DD HH:MM:SS', matching the TEXT timestamp
+    convention used by every other time column in this schema.  Keeping the
+    stored type consistent with `cycles.timestamp` makes §59 reconstruction
+    readable without conversion.  None stays None (nothing fabricated).
+    """
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(value), IST).strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _compact_reason(reasons):
+    """Serialize confirmation reasons as a compact JSON string for §59.
+
+    Reasons are short human-readable strings, so a compact JSON array keeps
+    them lossless (no delimiter collisions) while staying small.  None / empty
+    become NULL rather than an empty blob.
+    """
+    if not reasons:
+        return None
+    try:
+        return json.dumps(list(reasons), separators=(",", ":"))
+    except (TypeError, ValueError):
+        return None
+
+
 class CycleHistory:
     @staticmethod
     def save_cycle(cycle):
-        """Persist one analysis cycle (BLOCKORA §32) and return its cycle_id."""
+        """Persist one analysis cycle (BLOCKORA §32) and return its cycle_id.
+
+        This is the SINGLE authoritative cycle-write path.  Directional evidence
+        is written on the SAME row as the cycle it belongs to — never as a
+        second INSERT, which would violate the cycles.cycle_id primary key.
+
+        Directional columns are additive (schema v2/v3) and are populated for
+        every persisted cycle, including NO CLEAR STRIKE and data-quality
+        failures, so §59 reconstruction works for rejections too.  Values are
+        NULL when genuinely unavailable — nothing is fabricated.
+        """
         cur = db.execute("""
             INSERT INTO cycles (
                 timestamp, underlying, spot, expiry, regime, data_quality,
                 best_symbol, best_score, confidence, entry, stop_loss,
-                target, risk_reward, signal_state
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                target, risk_reward, signal_state,
+                direction, confirmed_move, direction_confirmed,
+                direction_origin_time, direction_origin_spot,
+                direction_confirm_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?)
         """, (
             _now_str(),
             cycle.get("underlying"),
@@ -36,12 +80,27 @@ class CycleHistory:
             cycle.get("target"),
             cycle.get("risk_reward"),
             cycle.get("signal_state"),
+            cycle.get("direction"),
+            cycle.get("confirmed_move"),
+            cycle.get("direction_confirmed"),
+            _origin_time_str(cycle.get("direction_origin_time")),
+            cycle.get("direction_origin_spot"),
+            _compact_reason(cycle.get("direction_confirm_reason")),
         ))
         return cur.lastrowid
 
     @staticmethod
     def latest_cycle():
-        return db.fetchone("SELECT * FROM cycles ORDER BY cycle_id DESC LIMIT 1")
+        """Most recent cycle as a plain dict, or None.
+
+        Every consumer (run_cycle's previous-cycle comparison and
+        history.outcomes.detect_state) calls `.get()` on the result, but
+        sqlite3.Row has no `.get()`.  Returning a Row therefore raised
+        AttributeError from cycle 2 onwards.  A dict satisfies every call site
+        with no other change.
+        """
+        row = db.fetchone("SELECT * FROM cycles ORDER BY cycle_id DESC LIMIT 1")
+        return dict(row) if row is not None else None
 
     @staticmethod
     def save_market_snapshot(cycle_id, underlying_snapshot, regime, data_quality, source=None):

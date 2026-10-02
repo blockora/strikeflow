@@ -87,6 +87,18 @@ class Config:
     # initial value; must be validated via walk-forward before tuning).
     TARGET_ATR_MULTIPLIER = _get_float("TARGET_ATR_MULTIPLIER", 1.5)
 
+    # --- Direction evidence (BLOCKORA Phase 1) ---
+    # Directories are read from environment: all real values are read from
+    # config so the engine has no embedded constants.
+    DIRECTION_MOVE_POINTS = _get_float("DIRECTION_MOVE_POINTS", 10.0)
+    DIRECTION_LOOKBACK_MINUTES = _get_int("DIRECTION_LOOKBACK_MINUTES", 5)
+    DIRECTION_PERSISTENCE_CYCLES = _get_int("DIRECTION_PERSISTENCE_CYCLES", 2)
+    # PERCENTAGE POINTS (0-100 scale), not a 0-1 fraction: the maximum share of
+    # the lookback peak-to-trough range that may be given back before a move is
+    # treated as a spike/V-shape. 25.0 means "at most 25% retraced".
+    DIRECTION_MAX_ADVERSE_PCT = _get_float("DIRECTION_MAX_ADVERSE_PCT", 25.0)
+    DIRECTION_REQUIRE_VWAP_AGREE = _get_bool("DIRECTION_REQUIRE_VWAP_AGREE", True)
+
     # --- Confidence (BLOCKORA §28, §65, §66) ---
     # Minimum outcome samples before historical evidence may raise confidence.
     # Enforced per BLOCKORA §65 ("Minimum sample requirements must be

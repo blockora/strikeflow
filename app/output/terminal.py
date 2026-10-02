@@ -43,6 +43,42 @@ def print_status_line(angel_status, jugaad_status, db_status, last_data, next_cy
     )
 
 
+def _fmt_signed(val, digits=1, na="N/A"):
+    """Signed numeric with an explicit +/- sign, so a DOWN move never renders
+    as "+-12.0".  Returns N/A for anything non-numeric."""
+    if val is None:
+        return na
+    try:
+        return f"{float(val):+.{digits}f}"
+    except (TypeError, ValueError):
+        return na
+
+
+def _direction_line(report, best=None):
+    """Print the direction evidence block. Nothing is fabricated: every line
+    prints only when the underlying data genuinely supports it."""
+    dir_value = report.get("direction") if best is None else best.get("direction")
+    confirmed = report.get("confirmed") if best is None else best.get("confirmed")
+    move_points = report.get("move_points") if best is None else best.get("move_points")
+    confirmation_reason = (
+        report.get("confirmation_reason") if best is None else best.get("confirmation_reason", [])
+    )
+
+    print(f"Direction   : {_fmt(dir_value)}")
+    if move_points is None:
+        # NEUTRAL / no usable move: nothing can be claimed about confirmation.
+        print("Confirmed   : N/A")
+    elif confirmed is True:
+        print(f"Confirmed   : {_fmt_signed(move_points)} pts (confirmed)")
+    elif confirmed is False:
+        print(f"Confirmed   : {_fmt_signed(move_points)} pts (not confirmed)")
+    else:
+        print(f"Confirmed   : {_fmt(confirmed)}")
+    setup = best.get("setup") if best is not None else report.get("setup")
+    if setup:
+        print(f"Setup       : {_fmt(setup)}")
+
+
 def _market_context(report):
     """Cycle/time and market context shared by both single-result blocks."""
     print(f"Cycle       : {_fmt(report.get('cycle_id'))}")
@@ -66,6 +102,7 @@ def print_best_strike(report, best):
     print("BLOCKORA — BEST STRIKE")
     print(_RULE)
     _market_context(report)
+    _direction_line(report, best)
     print(f"Strike      : {_fmt_strike(best.get('strike'))} {_fmt(best.get('option_type'))}")
     print(f"LTP         : {_fmt_num(best.get('ltp'))}")
     entry_low = best.get("entry_low")
@@ -106,6 +143,16 @@ def print_no_clear_strike(report):
     print("BLOCKORA — NO CLEAR STRIKE")
     print(_RULE)
     _market_context(report)
+    print(f"Direction   : {_fmt(report.get('direction'), 'NEUTRAL')}")
+    no_clear_move = report.get("move_points")
+    no_clear_confirmed = report.get("confirmed")
+    if no_clear_move is None:
+        print("Confirmed   : N/A")
+    elif no_clear_confirmed is True:
+        print(f"Confirmed   : {_fmt_signed(no_clear_move)} pts (confirmed)")
+    else:
+        print(f"Confirmed   : {_fmt_signed(no_clear_move)} pts (not confirmed)")
+    print(f"Setup       : {_fmt(report.get('setup'), 'N/A')}")
     print(f"Best Score  : {_fmt_num(report.get('best_raw_score'))}/100")
     print(f"Required    : {_fmt_num(report.get('required_score'))}/100")
     print(f"Confidence  : {_confidence(report)}")

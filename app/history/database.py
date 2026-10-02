@@ -206,7 +206,7 @@ class Database:
     # Current schema revision. Bump and append a matching step in _MIGRATIONS
     # whenever a committed schema change affects tables that may already exist
     # on a production device.
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 3
 
     # Additive-only migration steps, keyed by the schema version they upgrade
     # TO. Each step is (table, column, ddl); ddl must be an ALTER TABLE ADD
@@ -220,6 +220,40 @@ class Database:
                 "option_snapshots",
                 "data_timestamp",
                 "ALTER TABLE option_snapshots ADD COLUMN data_timestamp TEXT",
+            ),
+        ),
+        2: (
+            (
+                "cycles",
+                "direction",
+                "ALTER TABLE cycles ADD COLUMN direction TEXT",
+            ),
+            (
+                "cycles",
+                "confirmed_move",
+                "ALTER TABLE cycles ADD COLUMN confirmed_move REAL",
+            ),
+            (
+                "cycles",
+                "direction_confirmed",
+                "ALTER TABLE cycles ADD COLUMN direction_confirmed INTEGER",
+            ),
+            (
+                "cycles",
+                "direction_origin_time",
+                "ALTER TABLE cycles ADD COLUMN direction_origin_time TEXT",
+            ),
+            (
+                "cycles",
+                "direction_origin_spot",
+                "ALTER TABLE cycles ADD COLUMN direction_origin_spot REAL",
+            ),
+        ),
+        3: (
+            (
+                "cycles",
+                "direction_confirm_reason",
+                "ALTER TABLE cycles ADD COLUMN direction_confirm_reason TEXT",
             ),
         ),
     }
@@ -246,6 +280,9 @@ class Database:
             "cycle_id", "timestamp", "underlying", "spot", "expiry", "regime",
             "data_quality", "best_symbol", "best_score", "confidence",
             "entry", "stop_loss", "target", "risk_reward", "signal_state",
+            "direction", "confirmed_move", "direction_confirmed",
+            "direction_origin_time", "direction_origin_spot",
+            "direction_confirm_reason",
         ),
         "candidate_scores": (
             "cycle_id", "symbol", "strike", "option_type", "ltp", "bid",

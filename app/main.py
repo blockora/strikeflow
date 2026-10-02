@@ -12,6 +12,7 @@ Decision-support only: no order placement, modification or cancellation
 exists anywhere in this codebase (§54, §88).
 """
 
+import json
 import signal
 import sys
 import threading
@@ -34,6 +35,7 @@ from app.market.greeks import black_scholes_greeks
 from app.market.option_chain import OptionChainEngine
 from app.market.regime import MarketRegimeEngine
 from app.market.underlying import UnderlyingEngine
+from app.market.direction import DirectionEngine
 from app.output.terminal import print_cycle_report, print_status_line
 from app.scheduler import market_session_state, next_minute_boundary, sleep_until_next_cycle
 from app.selector.candidates import CandidateGenerator
@@ -64,6 +66,11 @@ class OptionStrikeSelector:
 
     def __init__(self):
         self.underlying_engine = UnderlyingEngine(config.UNDERLYING)
+        # One long-lived DirectionEngine bound to the SAME live
+        # UnderlyingEngine.  Constructing it per cycle would both lose the real
+        # price history and reset the persistence/episode state every cycle,
+        # making confirmation structurally unreachable.
+        self.direction_engine = DirectionEngine(self.underlying_engine)
         self.chain_engine = OptionChainEngine(config.UNDERLYING)
         self.regime_engine = MarketRegimeEngine()
         self.candidate_generator = CandidateGenerator(config.UNDERLYING)
@@ -292,27 +299,40 @@ class OptionStrikeSelector:
         underlying_snapshot = self.underlying_engine.snapshot()
         spot = underlying_snapshot.get("spot")
         data_quality = self.compute_data_quality()
+        # UnderlyingEngine.snapshot() has no data_quality key, but
+        # DirectionEngine enforces the §46/§57 DQ gate from the snapshot it is
+        # given.  Without this the DQ lookup is None and every cycle would be
+        # forced to NEUTRAL before any direction logic runs.
+        underlying_snapshot["data_quality"] = data_quality
+
+        # 12. regime — computed BEFORE candidate generation, which consumes it.
+        regime = self.regime_engine.classify(underlying_snapshot)
+
+        # 13. directional evidence (BLOCKORA Phase 1). One cycle-level result
+        # from the persistent engine, so every candidate sees the SAME evidence.
+        # This is a separate evidence layer over the underlying (spot, wall-clock
+        # returns, VWAP, DQ, session/day). It is NOT a score override:
+        # candidates scoring 64-68 stay below the BEST-STRIKE threshold unless
+        # the existing §15 scoring/gates independently promote them.
+        direction_evidence = self.direction_engine.generate(underlying_snapshot)
+
+        # Report skeleton always carries the real direction evidence, including
+        # for NO CLEAR STRIKE and data-quality failures.
+        report = self._no_signal_report(
+            now, spot, regime, data_quality=data_quality,
+            direction_evidence=direction_evidence,
+        )
 
         # §46/§57 hard gate: stale critical data must never produce a signal.
         if data_quality < config.MIN_DATA_QUALITY:
-            report = self._no_signal_report(now, spot, regime=None, data_quality=data_quality)
             report["no_signal_reasons"] = [
                 f"Data quality {data_quality} below minimum {config.MIN_DATA_QUALITY}; "
                 + ", ".join(self.last_quality_reasons or ["critical data stale/missing"])
             ]
             return report
 
-        # 5./6. underlying and option chain in snapshot form
-        chain = self.chain_engine.get_normalized_chain()
-        chain = self.chain_engine.overlay_angel_quotes(chain)
-
-        # 12. regime
-        regime = self.regime_engine.classify(underlying_snapshot)
-
         # 7./8. candidates (exactly 10 when sufficient data)
         candidates, candidate_status = self.candidate_generator.generate(spot, regime)
-
-        report = self._no_signal_report(now, spot, regime, data_quality=data_quality)
         report["candidate_status"] = candidate_status
 
         if data_quality < 100 and self.last_quality_reasons:
@@ -325,11 +345,10 @@ class OptionStrikeSelector:
         if candidate_status != "OK":
             report["no_signal_reasons"] = [f"INSUFFICIENT VALID CANDIDATES ({candidate_status})"]
             return report
-        # 9. metrics: Greeks then risk numbers
+
         candidates = self.attach_greeks(candidates, spot)
         candidates = self.ranking_engine.enrich_candidates(candidates, underlying_snapshot)
 
-        # 10. score
         scored = self.scoring_engine.score_candidates(candidates, underlying_snapshot, regime)
 
         # 11. previous cycle, 16. confidence, 17./18. gates
@@ -347,6 +366,26 @@ class OptionStrikeSelector:
             report["candidates"] = scored[: config.CANDIDATE_COUNT]
             report["best_raw_score"] = scored[0].get("total_score")
 
+        # Attach directional evidence to the scored candidates for terminal
+        # display and the confidence component. Direction evidence and the
+        # existing scoring/gates are separate layers and never merged into a
+        # single score.
+        for c in scored:
+            c["direction"] = direction_evidence.get("direction")
+            c["confirmed"] = direction_evidence.get("confirmed")
+            c["move_points"] = direction_evidence.get("move_points")
+            c["origin_spot"] = direction_evidence.get("origin_spot")
+            c["origin_time"] = direction_evidence.get("origin_time")
+            c["confirmation_reason"] = direction_evidence.get("confirmation_reason", [])
+            c["episode_confirmed"] = direction_evidence.get("episode_confirmed")
+            c["setup"] = self._setup_label(
+                direction_evidence.get("direction"),
+                direction_evidence.get("confirmed"),
+                direction_evidence.get("confirmation_reason") or [],
+            )
+        self._log_direction(direction_evidence)
+
+        # 14. best selection (rank+hard gates). Direction evidence is unchanged.
         if best is None:
             report["gate_reason"] = gate_reason
             report["no_signal_reasons"] = self._gate_failure_reasons(gate_reason, scored)
@@ -377,8 +416,18 @@ class OptionStrikeSelector:
             report["score_change"] = round(best["total_score"] - float(report["previous_score"]), 2)
         return report
 
-    def _no_signal_report(self, now, spot, regime=None, data_quality=None):
-        """Base report skeleton for a NO SIGNAL / early-return cycle."""
+    def _no_signal_report(self, now, spot, regime=None, data_quality=None,
+                           direction_evidence=None):
+        """Base report skeleton for a NO SIGNAL / early-return cycle.
+
+        Carries the REAL cycle-level direction evidence so a NO CLEAR STRIKE
+        block still reports what the underlying actually did. Direction is
+        never forced to NEUTRAL when evidence exists; confirmation is never
+        fabricated.
+        """
+        evidence = direction_evidence or {}
+        direction = evidence.get("direction") or "NEUTRAL"
+        confirmed = evidence.get("confirmed")
         return {
             "cycle_id": None,
             "time": now,
@@ -392,6 +441,17 @@ class OptionStrikeSelector:
             "candidate_status": None,
             "best_raw_score": None,
             "required_score": config.MIN_SCORE,
+            "direction": direction,
+            "confirmed": confirmed,
+            "move_points": evidence.get("move_points"),
+            "origin_spot": evidence.get("origin_spot"),
+            "origin_time": evidence.get("origin_time"),
+            "confirmation_reason": evidence.get("confirmation_reason") or [],
+            "missing_evidence": evidence.get("missing_evidence") or [],
+            "episode_id": evidence.get("episode_id"),
+            "setup": self._setup_label(
+                direction, confirmed, evidence.get("confirmation_reason") or []
+            ),
             "gate_reason": None,
             "no_signal_reasons": [],
             "confidence_value": None,
@@ -401,6 +461,47 @@ class OptionStrikeSelector:
             "score_change": None,
             "signal_state": "NO SIGNAL",
         }
+
+    @staticmethod
+    def _setup_label(direction, confirmed, reasons):
+        """Build a compact setup label from the real direction evidence.
+
+        Setup reflects what the data genuinely supports.  A fabricated value
+        (e.g. 'Volume confirmation' when volume was never verified) is never
+        printed.
+        """
+        if direction in (None, "NEUTRAL"):
+            return None
+        components = ["CONFIRMED" if confirmed is True else "PARTIAL"]
+        positive = [r for r in (reasons or []) if r and "not" not in r.lower()]
+        if positive:
+            components.append(" + ".join(positive[:2]))
+        return " ".join(components)
+
+    def _log_direction(self, direction_evidence):
+        """Log the directional evidence for a cycle (BLOCKORA Phase 1).
+
+        Direction is a separate evidence layer from the existing score and
+        gates. It is persisted to the cycles table so the why of a selection
+        can be reconstructed later (§59), without lowering MIN_SCORE or
+        bypassing any gate.
+        """
+        try:
+            db.log_event(
+                "DIRECTION_EVIDENCE",
+                json.dumps({
+                    "direction": direction_evidence.get("direction"),
+                    "confirmed": direction_evidence.get("confirmed"),
+                    "move_points": direction_evidence.get("move_points"),
+                    "origin_spot": direction_evidence.get("origin_spot"),
+                    "origin_time": direction_evidence.get("origin_time"),
+                    "confirmation_reason": direction_evidence.get("confirmation_reason", []),
+                    "episode_confirmed": direction_evidence.get("episode_confirmed"),
+                    "missing_evidence": direction_evidence.get("missing_evidence", []),
+                }),
+            )
+        except Exception:
+            logger.exception("Direction log failed")
 
     def _gate_failure_reasons(self, gate_reason, scored):
         reasons = []
@@ -433,6 +534,18 @@ class OptionStrikeSelector:
             logger.exception("Open-signal monitoring failed")
 
         best = report.get("best")
+        # Directional evidence is read from the CYCLE REPORT, not from `best`,
+        # so it is persisted on EVERY persisted cycle: BEST STRIKE, NO CLEAR
+        # STRIKE and data-quality/candidate failures alike.  Without this, a
+        # rejection could never be reconstructed (§59).  Direction remains a
+        # separate evidence layer: nothing here lowers MIN_SCORE or bypasses a
+        # gate.
+        cycle_direction = report.get("direction")
+        cycle_confirmed_move = report.get("move_points")
+        cycle_direction_confirmed = report.get("confirmed")
+        cycle_origin_time = report.get("origin_time")
+        cycle_origin_spot = report.get("origin_spot")
+        cycle_confirm_reason = report.get("confirmation_reason")
         cycle_id = CycleHistory.save_cycle({
             "underlying": report["underlying"],
             "spot": report["spot"],
@@ -449,6 +562,12 @@ class OptionStrikeSelector:
             "target": best.get("target") if best else None,
             "risk_reward": best.get("risk_reward") if best else None,
             "signal_state": report.get("signal_state"),
+            "direction": cycle_direction,
+            "confirmed_move": cycle_confirmed_move,
+            "direction_confirmed": cycle_direction_confirmed,
+            "direction_origin_time": cycle_origin_time,
+            "direction_origin_spot": cycle_origin_spot,
+            "direction_confirm_reason": cycle_confirm_reason,
         })
         report["cycle_id"] = cycle_id
 
