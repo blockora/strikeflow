@@ -36,6 +36,7 @@ from app.market.option_chain import OptionChainEngine
 from app.market.regime import MarketRegimeEngine
 from app.market.underlying import UnderlyingEngine
 from app.market.direction import DirectionEngine
+from app.market.option_history import OptionHistoryEngine
 from app.output.terminal import print_cycle_report, print_status_line
 from app.scheduler import market_session_state, next_minute_boundary, sleep_until_next_cycle
 from app.selector.candidates import CandidateGenerator
@@ -71,6 +72,10 @@ class OptionStrikeSelector:
         # price history and reset the persistence/episode state every cycle,
         # making confirmation structurally unreachable.
         self.direction_engine = DirectionEngine(self.underlying_engine)
+        # Bounded per-contract option history (BLOCKORA §83 Phase 5). Supplies
+        # the real option premium / volume / OI / IV series that §17 momentum,
+        # §18 OI, §19 relative volume and §23 IV change require.
+        self.option_history = OptionHistoryEngine()
         self.chain_engine = OptionChainEngine(config.UNDERLYING)
         self.regime_engine = MarketRegimeEngine()
         self.candidate_generator = CandidateGenerator(config.UNDERLYING)
@@ -332,6 +337,9 @@ class OptionStrikeSelector:
             return report
 
         # 7./8. candidates (exactly 10 when sufficient data)
+        # Record this cycle's real option observations BEFORE scoring so §17/§18/
+        # §19/§23 can measure against the genuinely previous cycles.
+        self.option_history.ingest(self.chain_engine.get_normalized_chain())
         candidates, candidate_status = self.candidate_generator.generate(spot, regime)
         report["candidate_status"] = candidate_status
 
@@ -347,6 +355,11 @@ class OptionStrikeSelector:
             return report
 
         candidates = self.attach_greeks(candidates, spot)
+        # Attach the real option-engine evidence each candidate measured. Every
+        # field is None when its real history is insufficient; nothing here is
+        # estimated (BLOCKORA §7).
+        for c in candidates:
+            c.update(self.option_history.snapshot_for(c))
         candidates = self.ranking_engine.enrich_candidates(candidates, underlying_snapshot)
 
         scored = self.scoring_engine.score_candidates(candidates, underlying_snapshot, regime)

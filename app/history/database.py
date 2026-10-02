@@ -206,7 +206,7 @@ class Database:
     # Current schema revision. Bump and append a matching step in _MIGRATIONS
     # whenever a committed schema change affects tables that may already exist
     # on a production device.
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     # Additive-only migration steps, keyed by the schema version they upgrade
     # TO. Each step is (table, column, ddl); ddl must be an ALTER TABLE ADD
@@ -256,6 +256,39 @@ class Database:
                 "ALTER TABLE cycles ADD COLUMN direction_confirm_reason TEXT",
             ),
         ),
+        # Option Engine evidence (BLOCKORA §17/§18/§19/§21/§22/§23). Scalars
+        # only: no JSON/blob columns, so per-minute persistence stays bounded on
+        # Android storage (BLOCKORA §59, §75). Two previously computed but
+        # unrecorded components (underlying_trend_score, atm_suitability_score)
+        # are added so §59 reconstruction can explain the whole score.
+        4: (
+            ("candidate_scores", "underlying_trend_score",
+             "ALTER TABLE candidate_scores ADD COLUMN underlying_trend_score REAL"),
+            ("candidate_scores", "atm_suitability_score",
+             "ALTER TABLE candidate_scores ADD COLUMN atm_suitability_score REAL"),
+            ("candidate_scores", "option_return_1m",
+             "ALTER TABLE candidate_scores ADD COLUMN option_return_1m REAL"),
+            ("candidate_scores", "option_return_3m",
+             "ALTER TABLE candidate_scores ADD COLUMN option_return_3m REAL"),
+            ("candidate_scores", "opt_acceleration",
+             "ALTER TABLE candidate_scores ADD COLUMN opt_acceleration REAL"),
+            ("candidate_scores", "relative_volume",
+             "ALTER TABLE candidate_scores ADD COLUMN relative_volume REAL"),
+            ("candidate_scores", "prev_oi",
+             "ALTER TABLE candidate_scores ADD COLUMN prev_oi REAL"),
+            ("candidate_scores", "oi_change_pct",
+             "ALTER TABLE candidate_scores ADD COLUMN oi_change_pct REAL"),
+            ("candidate_scores", "moneyness",
+             "ALTER TABLE candidate_scores ADD COLUMN moneyness TEXT"),
+            ("candidate_scores", "iv_change",
+             "ALTER TABLE candidate_scores ADD COLUMN iv_change REAL"),
+            ("candidate_scores", "iv_percentile",
+             "ALTER TABLE candidate_scores ADD COLUMN iv_percentile REAL"),
+            ("candidate_scores", "oi_source",
+             "ALTER TABLE candidate_scores ADD COLUMN oi_source TEXT"),
+            ("candidate_scores", "option_samples",
+             "ALTER TABLE candidate_scores ADD COLUMN option_samples INTEGER"),
+        ),
     }
 
     # Columns the application actually reads/writes per table (INSERT
@@ -290,6 +323,11 @@ class Database:
             "theta", "vega", "momentum_score", "oi_score", "volume_score",
             "liquidity_score", "greeks_score", "iv_score",
             "risk_reward_score", "total_score", "rank",
+            "underlying_trend_score", "atm_suitability_score",
+            "option_return_1m", "option_return_3m", "opt_acceleration",
+            "relative_volume", "prev_oi", "oi_change_pct",
+            "moneyness", "iv_change", "iv_percentile",
+            "oi_source", "option_samples",
         ),
         "signals": (
             "signal_id", "created_at", "underlying", "expiry", "strike",

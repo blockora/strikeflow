@@ -99,6 +99,21 @@ class Config:
     DIRECTION_MAX_ADVERSE_PCT = _get_float("DIRECTION_MAX_ADVERSE_PCT", 25.0)
     DIRECTION_REQUIRE_VWAP_AGREE = _get_bool("DIRECTION_REQUIRE_VWAP_AGREE", True)
 
+    # --- Option Engine history bounds (BLOCKORA §83 Phase 5, §75 Android 14) ---
+    # Bounded per-contract history of REAL observed LTP/volume/OI/IV, used by
+    # §17 momentum, §18 OI, §19 relative volume and §23 IV change. Fixed-size
+    # buffers only: memory is bounded regardless of chain width.
+    OPTION_HISTORY_MAX_CONTRACTS = _get_int("OPTION_HISTORY_MAX_CONTRACTS", 48)
+    OPTION_HISTORY_MAX_POINTS = _get_int("OPTION_HISTORY_MAX_POINTS", 90)
+    # Minimum REAL prior observations before an average may be used at all.
+    OPTION_MIN_AVG_SAMPLES = _get_int("OPTION_MIN_AVG_SAMPLES", 3)
+    # Window of prior samples used for the volume average and IV percentile.
+    OPTION_VOLUME_AVG_POINTS = _get_int("OPTION_VOLUME_AVG_POINTS", 10)
+    OPTION_IV_HISTORY_POINTS = _get_int("OPTION_IV_HISTORY_POINTS", 20)
+    # Minimum real IV samples before a percentile may be stated (BLOCKORA §23).
+    # Below this the IV percentile stays None rather than being invented.
+    IV_PERCENTILE_MIN_SAMPLES = _get_int("IV_PERCENTILE_MIN_SAMPLES", 10)
+
     # --- Confidence (BLOCKORA §28, §65, §66) ---
     # Minimum outcome samples before historical evidence may raise confidence.
     # Enforced per BLOCKORA §65 ("Minimum sample requirements must be

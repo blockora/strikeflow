@@ -155,13 +155,17 @@ class CycleHistory:
         """Persist scored candidates (BLOCKORA §62) for the given cycle."""
         for c in candidates:
             scores = c.get("scores", {})
-            db.execute("""
-                INSERT INTO candidate_scores (
-                    cycle_id, symbol, strike, option_type, ltp, bid, ask,
-                    volume, oi, oi_change, iv, delta, gamma, theta, vega,
-                    momentum_score, oi_score, volume_score, liquidity_score,
-                    greeks_score, iv_score, risk_reward_score, total_score, rank
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            db.execute("""INSERT INTO candidate_scores (
+                cycle_id, symbol, strike, option_type, ltp, bid, ask,
+                volume, oi, oi_change, iv, delta, gamma, theta, vega,
+                momentum_score, oi_score, volume_score, liquidity_score,
+                greeks_score, iv_score, risk_reward_score, total_score, rank,
+                underlying_trend_score, atm_suitability_score,
+                option_return_1m, option_return_3m, opt_acceleration,
+                relative_volume, prev_oi, oi_change_pct,
+                moneyness, iv_change, iv_percentile, oi_source, option_samples
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 cycle_id,
                 f"{c.get('underlying')} {c.get('strike')} {c.get('option_type')}",
@@ -187,4 +191,19 @@ class CycleHistory:
                 scores.get("risk_reward"),
                 c.get("total_score"),
                 c.get("rank"),
+                # Option Engine evidence (BLOCKORA §17-§23, §59). Scalars only;
+                # None when the underlying real history was insufficient.
+                scores.get("underlying_trend"),
+                scores.get("atm_suitability"),
+                c.get("opt_return_1m"),
+                c.get("opt_return_3m"),
+                c.get("opt_acceleration"),
+                c.get("relative_volume"),
+                c.get("prev_oi"),
+                c.get("oi_change_pct"),
+                c.get("moneyness"),
+                c.get("iv_change"),
+                c.get("iv_percentile"),
+                c.get("oi_source"),
+                c.get("option_samples"),
             ))
