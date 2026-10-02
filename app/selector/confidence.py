@@ -159,11 +159,17 @@ class ConfidenceEngine:
                 else:
                     previous_consistency = 55
 
+        # UNIT CONTRACT: every term below is an EVIDENCE SCORE on a 0-100
+        # scale multiplied by its weight. `scores["liquidity"]` is already a
+        # 0-100 normalized component (BLOCKORA §15 scoring engine), so the
+        # weight is applied directly. The historical `* 10` factor assumed the
+        # old 0-10 spread score and inflated this term 10x, saturating total
+        # confidence at 100.0 and silently defeating the MIN_CONFIDENCE gate.
         confidence = (
             score * _WEIGHT_SCORE
             + data_quality * _WEIGHT_DATA_QUALITY
             + rr_norm * 100 * _WEIGHT_RISK_REWARD
-            + liquidity * 10 * _WEIGHT_LIQUIDITY
+            + liquidity * _WEIGHT_LIQUIDITY
             + source_agreement * _WEIGHT_SOURCE_AGREEMENT
             + regime_clarity * _WEIGHT_REGIME_CLARITY
             + historical_evidence * _WEIGHT_HISTORICAL
